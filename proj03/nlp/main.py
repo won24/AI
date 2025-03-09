@@ -17,6 +17,23 @@ import numpy as np
 from fastapi.responses import FileResponse
 
 
+import argparse
+import cv2
+import sys
+import numpy as np
+import insightface
+from insightface.app import FaceAnalysis
+from insightface.data import get_image as ins_get_image
+
+
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+import torch
+
+
+from transformers import pipeline
+reivew_classifier = pipeline("sentiment-analysis", model="stevhliu/my_awesome_model")
+
+
 # MediaPipe 모델 설정 - 전역변수로 빼 놓는 것이 좋음
 base_options = python.BaseOptions(model_asset_path='models/efficientnet_lite0.tflite')
 options = vision.ImageClassifierOptions(base_options=base_options, max_results=3)
@@ -26,7 +43,12 @@ base_options = python.BaseOptions(model_asset_path='models\efficientdet_lite0.tf
 options = vision.ObjectDetectorOptions(base_options=base_options, score_threshold=0.5)
 detector = vision.ObjectDetector.create_from_options(options)
 
+model_name = "circulus/kobart-trans-ko-en-v2"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
 
+
+# 이미지 분류 박스
 MARGIN = 10  # pixels
 ROW_SIZE = 10  # pixels
 FONT_SIZE = 1
@@ -57,6 +79,10 @@ def visualize(
 
 
 
+face_model = FaceAnalysis()
+face_model.prepare(ctx_id=0, det_size=(640,640))
+
+
 # FastAPI 인스턴스 생성
 app = FastAPI()
 
@@ -78,8 +104,36 @@ def read_root():
 def read_item(item_id: int = 1, q: Union[str, None] = "test"):
     return {"item_id": item_id, "q": q}
 
+#  번역 
+@app.get("/translation")
+def translation(input_text: str):
+
+    # 번역할 한국어 문장
+    text = input_text
+    # 토큰화 및 입력 변환 (token_type_ids 제거)
+    inputs = tokenizer(text, return_tensors="pt")
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+    # 모델 추론 수행 (token_type_ids 제거)
+    outputs = model.generate(input_ids=input_ids, attention_mask=attention_mask)
+    # 번역 결과 디코딩
+    translated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    print("번역 결과:", translated_text)
+
+    result = translated_text
+    return {"translation": result}
 
 
+# 리뷰 분석
+@app.get("/review_classification")
+def review_classification(input_text: str):
+    result = reivew_classifier(input_text)
+    return {"classification": result}
+
+
+
+
+# 이미지 분석
 @app.post("/img_cls")
 async def img_cls(
     image: UploadFile = File(...)  # '...'는 필수 파라미터를 의미
@@ -118,6 +172,38 @@ async def img_cls(
     )
 
 
+
+
+# 이미지 분류 
+@app.post("/img_det")
+async def img_det(
+    image: UploadFile = File(...)
+):
+    contents = await image.read()
+    filename = f"temp_{image.filename}"
+    with open(filename, "wb") as f:
+        f.write(contents)
+    
+    image = mp.Image.create_from_file(filename)
+
+    detection_result = detector.detect(image)
+
+    objects = []
+    for detection in detection_result.detections:
+        objects.append(detection)
+    print(f"Find Object : {len(objects)}")
+        
+    image_copy = np.copy(image.numpy_view())
+    annotated_image = visualize(image_copy, detection_result)
+    rgb_annotated_image = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
+    
+    cv2.imwrite("test.jpg", rgb_annotated_image)
+    os.remove(filename)
+    return FileResponse("test.jpg")
+
+
+
+# 얼굴 인식1
 @app.post("/face_recognition")
 async def face_recognition(
     image1: UploadFile = File(...),
@@ -148,31 +234,33 @@ async def face_recognition(
 
 
 
-
-@app.post("/img_det")
-async def img_det(
-    image: UploadFile = File(...)
+# 얼굴 인식2
+@app.post("/face_reco")
+async def face_recognition(
+    image1: UploadFile = File(...),
+    image2: UploadFile = File(...)
 ):
-    contents = await image.read()
-    filename = f"temp_{image.filename}"
-    with open(filename, "wb") as f:
+    contents = await image1.read()
+    filename1 = image1.filename
+    with open(filename1, "wb") as f:
         f.write(contents)
+    contents = await image2.read()
+    filename2 = image2.filename
+    with open(filename2, "wb") as f:
+        f.write(contents)
+    img1 = cv2.imread(filename1)
+    img2 = cv2.imread(filename2)
+
+    faces1 = face_model.get(img1)
+    assert len(faces1)==1
+    faces2 = face_model.get(img2)
+    assert len(faces2)==1
+    feat1 = np.array(faces1[0].normed_embedding, dtype=np.float32)
+    feat2 = np.array(faces2[0].normed_embedding, dtype=np.float32)
+    sims = np.dot(feat1, feat2.T)
+    print(sims)
     
-    # STEP 3: Load the input image.
-    image = mp.Image.create_from_file(filename)
-    # STEP 4: Detect objects in the input image.
-    detection_result = detector.detect(image)
-    # print(detection_result)
-    # STEP 5: Process the detection result. In this case, visualize it.
-    objects = []
-    for detection in detection_result.detections:
-        objects.append(detection)
-    print(f"Find Object : {len(objects)}")
-        
-    image_copy = np.copy(image.numpy_view())
-    annotated_image = visualize(image_copy, detection_result)
-    rgb_annotated_image = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
-    
-    cv2.imwrite("test.jpg", rgb_annotated_image)
-    os.remove(filename)
-    return FileResponse("test.jpg")
+    return {
+        "message": "얼굴 인식 요청이 성공적으로 처리되었습니다",
+        "similarity": float(sims)
+    }
